@@ -12,7 +12,7 @@ class Processor():
     def __init__(self, model):
         # load tensorrt engine
         TRT_LOGGER = trt.Logger(trt.Logger.INFO)
-        TRTbin = '{0}/models/{1}'.format(os.path.dirname(__file__), model)
+        TRTbin = model#'{0}/models/{1}'.format(os.path.dirname(__file__), model)
         print('trtbin', TRTbin)
         with open(TRTbin, 'rb') as f, trt.Runtime(TRT_LOGGER) as runtime:
             engine = runtime.deserialize_cuda_engine(f.read())
@@ -21,26 +21,27 @@ class Processor():
         inputs, outputs, bindings = [], [], []
         stream = cuda.Stream()
         for binding in engine:
-            size = trt.volume(engine.get_binding_shape(binding))
-            dtype = trt.nptype(engine.get_binding_dtype(binding))
+            size = trt.volume(engine.get_tensor_shape(binding))
+            dtype = trt.nptype(engine.get_tensor_dtype(binding))
             host_mem = cuda.pagelocked_empty(size, dtype)
             device_mem = cuda.mem_alloc(host_mem.nbytes)
             bindings.append(int(device_mem))
-            if engine.binding_is_input(binding):
-                inputs.append({ 'host': host_mem, 'device': device_mem })
-            else:
-                outputs.append({ 'host': host_mem, 'device': device_mem })
+            if (engine.get_tensor_mode(binding).name == 'INPUT'):
+                inputs.append({'host': host_mem, 'device': device_mem})
+            elif (engine.get_tensor_mode(binding).name == 'OUTPUT'):
+                outputs.append({'host': host_mem, 'device': device_mem})
         # save to class
         self.inputs = inputs
         self.outputs = outputs
         self.bindings = bindings
         self.stream = stream
         # post processing config
-        filters = (80 + 5) * 3
+        num_cl = 1
+        filters = (num_cl + 5) * 3
         self.output_shapes = [
-            (1, 3, 80, 80, 85),
-            (1, 3, 40, 40, 85),
-            (1, 3, 20, 20, 85)
+            (1, 3, 80, 80, num_cl + 5),
+            (1, 3, 40, 40, num_cl + 5),
+            (1, 3, 20, 20, num_cl + 5)
         ]
         self.strides = np.array([8., 16., 32.])
         anchors = np.array([
@@ -49,7 +50,7 @@ class Processor():
             [[116,90], [156,198], [373,326]],
         ])
         self.nl = len(anchors)
-        self.nc = 80 # classes
+        self.nc = 1 # classes
         self.no = self.nc + 5 # outputs per anchor
         self.na = len(anchors[0])
         a = anchors.copy().astype(np.float32)
@@ -69,10 +70,10 @@ class Processor():
 
     def pre_process(self, img):
         print('original image shape', img.shape)
-        img = cv2.resize(img, (640, 640))
+        # img = cv2.resize(img, (640, 640))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        # img = img.transpose((2, 0, 1)).astype(np.float16)
-        img = img.transpose((2, 0, 1)).astype(np.float32)
+        img = img.transpose((2, 0, 1)).astype(np.float16)
+        # img = img.transpose((2, 0, 1)).astype(np.float32)
         img /= 255.0
         return img
 
@@ -82,15 +83,15 @@ class Processor():
         self.inputs[0]['host'] = np.ravel(img)
         # transfer data to the gpu
         for inp in self.inputs:
-            cuda.memcpy_htod_async(inp['device'], inp['host'], self.stream)
+            cuda.memcpy_htod(inp['device'], inp['host'])
         # run inference
         start = time.time()
-        self.context.execute_async_v2(
-                bindings=self.bindings,
-                stream_handle=self.stream.handle)
+        self.context.execute_v2(
+                bindings=self.bindings)#,
+                #stream_handle=self.stream.handle)
        # fetch outputs from gpu
         for out in self.outputs:
-            cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
+            cuda.memcpy_dtoh(out['host'], out['device'])
         # synchronize stream
         self.stream.synchronize()
         end = time.time()
@@ -125,7 +126,7 @@ class Processor():
             class_grids.append(obj_class_probs)
         return class_grids
 
-    def extract_boxes(self, output, conf_thres=0.5):
+    def extract_boxes(self, output, conf_thres=0.1):
         """
         Extracts boxes (xywh) -> (x1, y1, x2, y2)
         """
@@ -138,13 +139,14 @@ class Processor():
             grids.append(grid)
             scaled.append(out)
         z = []
+        numcl=1
         for out, grid, stride, anchor in zip(scaled, grids, self.strides, self.anchor_grid):
             _, _, width, height, _ = out.shape
             out[..., 0:2] = (out[..., 0:2] * 2. - 0.5 + grid) * stride
             out[..., 2:4] = (out[..., 2:4] * 2) ** 2 * anchor
 
             out[..., 5:] = out[..., 4:5] * out[..., 5:]
-            out = out.reshape((1, 3 * width * height, 85))
+            out = out.reshape((1, 3 * width * height, numcl+5))
             z.append(out)
         pred = np.concatenate(z, 1)
         xc = pred[..., 4] > conf_thres
@@ -152,7 +154,7 @@ class Processor():
         boxes = self.xywh2xyxy(pred[:, :4])
         return boxes
 
-    def post_process(self, outputs, conf_thres=0.5):
+    def post_process(self, outputs, conf_thres=0.1):
         """
         Transforms raw output into boxes, confs, classes
         Applies NMS thresholding on bounding boxes and confs
@@ -172,12 +174,13 @@ class Processor():
             grids.append(grid)
             scaled.append(out)
         z = []
+        numcl=1
         for out, grid, stride, anchor in zip(scaled, grids, self.strides, self.anchor_grid):
             _, _, width, height, _ = out.shape
             out[..., 0:2] = (out[..., 0:2] * 2. - 0.5 + grid) * stride
             out[..., 2:4] = (out[..., 2:4] * 2) ** 2 * anchor
             
-            out = out.reshape((1, 3 * width * height, 85))
+            out = out.reshape((1, 3 * width * height, numcl+5))
             z.append(out)
         pred = np.concatenate(z, 1)
         xc = pred[..., 4] > conf_thres
@@ -209,7 +212,7 @@ class Processor():
     def exponential_v(self, array):
         return np.exp(array)
     
-    def non_max_suppression(self, boxes, confs, classes, iou_thres=0.6):
+    def non_max_suppression(self, boxes, confs, classes, iou_thres=0.9):
         x1 = boxes[:, 0]
         y1 = boxes[:, 1]
         x2 = boxes[:, 2]
@@ -235,7 +238,7 @@ class Processor():
         classes = classes[keep]
         return boxes, confs, classes
 
-    def nms(self, pred, iou_thres=0.6):
+    def nms(self, pred, iou_thres=0.9):
         boxes = self.xywh2xyxy(pred[..., 0:4])
         # best class only
         confs = np.amax(pred[:, 5:], 1, keepdims=True)
