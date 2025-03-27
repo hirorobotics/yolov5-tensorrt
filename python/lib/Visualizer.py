@@ -9,16 +9,16 @@ import matplotlib.pyplot as plt
 import matplotlib.image as mimg
 from PIL import Image
 
-from classes import coco
+from classes import dataset
 
 class Visualizer():
     def __init__(self):
-        self.color_list = self.gen_colors(coco)
+        self.color_list = self.gen_colors(dataset)
     
     def gen_colors(self, classes):
         """
             generate unique hues for each class and convert to bgr
-            classes -- list -- class names (80 for coco dataset)
+            classes -- list -- class names (1 for dataset)
             -> list
         """
         hsvs = []
@@ -159,7 +159,7 @@ class Visualizer():
             cv2.line(c2, (y, 0), (y, 650), color=(0, 255, 0), thickness=1, lineType=cv2.LINE_AA)
             y += px_step
 
-    def draw_results(self, img, boxes, confs, classes):
+    def draw_results(self, img, boxes, confs, classes, name):
         window_name = 'final results'
         cv2.namedWindow(window_name)
         overlay = img.copy()
@@ -168,7 +168,7 @@ class Visualizer():
             # draw rectangle
             x1, y1, x2, y2 = box
             conf = conf[0]
-            cls_name = coco[cls]
+            cls_name = dataset[cls]
             color = self.color_list[cls]
             cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
             # draw text
@@ -176,4 +176,5 @@ class Visualizer():
         cv2.addWeighted(overlay, 0.5, final, 1 - 0.5, 0, final)
         cv2.imshow(window_name, final)
         cv2.waitKey(20)
+        success = cv2.imwrite('{}'.format(name), final)
         return final
